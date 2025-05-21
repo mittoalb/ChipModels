@@ -12,75 +12,19 @@ parent_dir  = os.path.abspath(os.path.join(current_dir, os.pardir))
 if parent_dir not in sys.path:
     sys.path.insert(0, parent_dir)
 
-from logger import setup_custom_logger, log_exception
-#from utils import save_mzarr
 
+from tomomodels.logger import setup_custom_logger, log_exception
+from tomomodels.utils import save_mzarr
 
 logger = setup_custom_logger("chipgen", lfname="chipgen.log")
 
 
-def save_mzarr(data, codes, out_dir,
-               voxel_size, n_scales, base_chunk, logger):
-    if os.path.exists(out_dir):
-        shutil.rmtree(out_dir)
-    f = z5py.File(out_dir, use_zarr_format=True)
-    curr = data
-    datasets = []
-    for lvl in range(n_scales):
-        path   = str(lvl)
-        chunks = tuple(min(c, s) for c, s in zip(base_chunk, curr.shape))
-        f.create_dataset(path, data=curr, chunks=chunks, compression="raw")
-        scale = 2**lvl
-        datasets.append({
-            "path": path,
-            "coordinateTransformations": [
-                {"type": "scale",       "scale": [scale]*3},
-                {"type": "translation", "translation": [scale/2 - 0.5]*3},
-            ]
-        })
-        curr = curr[::2, ::2, ::2]
-
-    # Save original codes as-is for internal use
-    f.attrs["lookup"]     = codes
-    f.attrs["voxel_size"] = voxel_size
-
-    multiscale_meta = {
-        "version": "0.4",
-        "axes": [
-            {"name": "z", "type": "space"},
-            {"name": "y", "type": "space"},
-            {"name": "x", "type": "space"},
-        ],
-        "datasets": datasets,
-        "type": "image",
-        "metadata": {
-            "voxel_size": voxel_size
-        }
-    }
-
-    # Add brain-style "materials" layout to the JSON
-    materials = {
-        str(v): {"alias": k} for k, v in codes.items()
-    }
-
-    with open(os.path.join(out_dir, "multiscale.json"), "w") as fj:
-        json.dump({
-            "multiscale": multiscale_meta,
-            "materials": materials
-        }, fj, indent=2)
-
-    if logger:
-        logger.info(f"Saved multiscale Zarr → {out_dir}")
-
-
-
-
-#--------------------------------------------------
-# 0) Load parameters
-#--------------------------------------------------
 # Load material codes from external JSON
 with open("chip_codes.json", "r") as f:
-    CODES = json.load(f)
+    LABELS = json.load(f)
+
+# Create shortcut mapping: name -> label
+CODES = {k: v["label"] for k, v in LABELS.items()}
 
 #--------------------------------------------------
 # 1) Substrate & Oxides
@@ -92,6 +36,592 @@ def add_substrate(shape, layers):
     used = sum(th for _, th in layers)
     substrate_th = shape[0] - used
     return layers + [('Si_substrate', substrate_th)]
+
+
+def add_well_taps(
+    vol: np.ndarray,
+    layers: list[tuple[str, int]],
+    well_type: str = 'nwell',
+    tap_code: str = 'pad_contact',
+    plug_code: str = 'W_plug',
+    diameter: int = 6,
+    pitch: int = 64
+) -> np.ndarray:
+    """
+    Add regular tap contacts in the specified well region (pwell or nwell).
+
+    Parameters
+    ----------
+    vol : ndarray (nz, ny, nx)
+        3D chip volume.
+    layers : list of (name, thickness)
+        Layer stack.
+    well_type : str
+        Either 'nwell' or 'pwell'.
+    tap_code : str
+        Label for metal pad to fill the top.
+    plug_code : str
+        Label for plug metal to fill the lower part.
+    diameter : int
+        Diameter of each tap contact.
+    pitch : int
+        Spacing between taps in Y and X.
+    """
+    nz, ny, nx = vol.shape
+    ys, xs = np.ogrid[:ny, :nx]
+    r = diameter // 2
+
+    out = vol.copy()
+
+    # --- Locate well z-range ---
+    z_acc = 0
+    z_well_top = z_well_bot = None
+    for name, th in layers:
+        if name == 'Si_substrate':
+            z_well_top = z_acc
+            z_well_bot = min(z_well_top + 20, nz)
+            break
+        z_acc += th
+
+    if z_well_top is None:
+        raise ValueError("Si_substrate not found in layers list.")
+
+    # --- Locate pad_contact and passivation range ---
+    z_pad_s = z_pass_s = None
+    z_acc = 0
+    for name, th in layers:
+        if name == 'SiN_passivation':
+            z_pass_s = z_acc
+        if name == 'pad_contact':
+            z_pad_s = z_acc
+        z_acc += th
+
+    if z_pass_s is None or z_pad_s is None:
+        raise ValueError("Missing SiN_passivation or pad_contact layer.")
+
+    # --- Place taps at regular intervals ---
+    for cy in range(r, ny, pitch):
+        for cx in range(r, nx, pitch):
+            # check if we're over the correct well
+            if vol[z_well_top, cy, cx] != CODES[well_type]:
+                continue
+            mask = (ys - cy)**2 + (xs - cx)**2 <= r*r
+            # fill passivation
+            for zz in range(z_pass_s, z_pass_s + 5):
+                out[zz][mask] = CODES[tap_code]
+            # fill pad_contact
+            for zz in range(z_pad_s, z_pad_s + 4):
+                out[zz][mask] = CODES[plug_code]
+
+    return out
+
+def add_io_periphery_routing(
+    vol: np.ndarray,
+    layers: list[tuple[str,int]],
+    metal_layer: str = 'Cu5',
+    trace_width: int = 6,
+    trace_thickness: int = 2,
+    ring_offset: int = 10
+) -> np.ndarray:
+    """
+    Add thick I/O routing traces near the die edge (top metal layer).
+    """
+    nz, ny, nx = vol.shape
+    out = vol.copy()
+
+    # Find top metal z-range
+    z0 = 0
+    for name, th in layers:
+        if name == metal_layer:
+            z_top = z0 + layers[-1][1] - trace_thickness
+            break
+        z0 += th
+
+    metal_val = CODES[metal_layer]
+
+    # Create horizontal and vertical periphery lines
+    x0, x1 = ring_offset, nx - ring_offset
+    y0, y1 = ring_offset, ny - ring_offset
+
+    for z in range(z_top, z_top + trace_thickness):
+        # Top and bottom lines
+        out[z, y0:y0+trace_width, x0:x1] = metal_val
+        out[z, y1-trace_width:y1, x0:x1] = metal_val
+        # Left and right lines
+        out[z, y0:y1, x0:x0+trace_width] = metal_val
+        out[z, y0:y1, x1-trace_width:x1] = metal_val
+
+    return out
+
+def add_sram_block(vol, layers, region):
+    """
+    Add SRAM macro block as a dense rectangular fill of pattern.
+    """
+    z_range, y_range, x_range = region
+    z0, z1 = z_range
+    y0, y1 = y_range
+    x0, x1 = x_range
+    out = vol.copy()
+    metal_val = CODES['Cu2']
+
+    # Fill as repeating grid pattern
+    for z in range(z0 + 20, z0 + 24):  # pick mid metal layer
+        for y in range(y0, y1, 8):
+            for x in range(x0, x1, 8):
+                out[z, y:y+2, x:x+6] = metal_val
+
+    return out
+
+def add_analog_block(vol, layers, region):
+    """
+    Add sparse analog transistors in a corner zone.
+    """
+    z_range, y_range, x_range = region
+    z0, z1 = z_range
+    y0, y1 = y_range
+    x0, x1 = x_range
+    out = vol.copy()
+    ys, xs = np.ogrid[y0:y1, x0:x1]
+
+    cy, cx = (y0 + y1)//2, (x0 + x1)//2
+    for z in range(z0 + 10, z0 + 14):
+        mask = ((ys - cy)**2 + (xs - cx)**2) < 1000
+        out[z, y0:y1, x0:x1][mask] = CODES['Cu1']
+
+    return out
+
+
+def add_dummy_fills(
+    vol: np.ndarray,
+    layers: list[tuple[str, int]],
+    layer_name: str = 'Cu2',
+    code_key: str = 'Cu2',
+    size: int = 6,
+    spacing: int = 24,
+    coverage: float = 0.2,
+    seed: int = 123
+) -> np.ndarray:
+    """
+    Add dummy metal fill blocks to a metal layer for density balancing.
+
+    Parameters
+    ----------
+    vol : ndarray (nz, ny, nx)
+    layers : list of (name, thickness)
+    layer_name : str
+        Which metal layer to sprinkle fills into.
+    code_key : str
+        Material code (e.g., Cu2).
+    size : int
+        Dummy square side length in voxels.
+    spacing : int
+        Center-to-center spacing of dummy fills.
+    coverage : float
+        Probability to actually place a dummy at each grid point.
+    seed : int
+        RNG seed for reproducibility.
+    """
+    out = vol.copy()
+    nz, ny, nx = vol.shape
+    rng = np.random.default_rng(seed)
+
+    # Find layer z-range
+    z_acc = 0
+    z0 = z1 = None
+    for name, th in layers:
+        if name == layer_name:
+            z0 = z_acc
+            z1 = z0 + th
+            break
+        z_acc += th
+    if z0 is None:
+        raise ValueError(f"Layer {layer_name} not found.")
+
+    # Define fill region
+    code = CODES[code_key]
+    half = size // 2
+    for y in range(spacing, ny - spacing, spacing):
+        for x in range(spacing, nx - spacing, spacing):
+            if rng.random() > coverage:
+                continue
+            ys = slice(max(0, y - half), min(ny, y + half + 1))
+            xs = slice(max(0, x - half), min(nx, x + half + 1))
+            for z in range(z0, z1):
+                out[z, ys, xs] = code
+    return out
+
+
+
+def add_active_region_isolation(vol, layers, y_positions, width=4, code_key='STI'):
+    """Insert vertical STI strips to isolate transistor rows (CMOS active region separation)."""
+    nz, ny, nx = vol.shape
+    out = vol.copy()
+
+    # find top of substrate
+    z_acc = 0
+    for name, th in layers:
+        if name == 'Si_substrate':
+            z_sub = z_acc
+            break
+        z_acc += th
+
+    z_depth = 10  # how deep into substrate to go
+    for y in y_positions:
+        y0 = max(0, y - width//2)
+        y1 = min(ny, y + width//2)
+        out[z_sub:z_sub+z_depth, y0:y1, :] = CODES[code_key]
+
+    return out
+
+
+def add_sram_macro_blocks(
+    vol: np.ndarray,
+    layers: list[tuple[str, int]],
+    layer_name: str = 'Cu3',
+    block_size: tuple[int, int] = (64, 64),
+    pattern_pitch: int = 4,
+    pattern_type: str = 'checker',
+    positions: list[tuple[int, int]] = None,
+    code_key: str = 'Cu3'
+) -> np.ndarray:
+    """
+    Add SRAM-like macro blocks with internal bitcell pattern to a metal layer.
+
+    Parameters
+    ----------
+    vol : ndarray (nz, ny, nx)
+    layers : list of (name, thickness)
+    layer_name : str
+        Target layer for SRAM macro.
+    block_size : (int, int)
+        Size of each macro (height, width in voxels).
+    pattern_pitch : int
+        Pattern repetition size (e.g., checkerboard granularity).
+    pattern_type : str
+        One of: 'checker', 'lines', 'solid'.
+    positions : list of (cy, cx)
+        Center YX coordinates of each macro.
+    code_key : str
+        Material label from CODES.
+    """
+    nz, ny, nx = vol.shape
+    out = vol.copy()
+
+    # Get z-range for layer
+    z_acc = 0
+    for name, th in layers:
+        if name == layer_name:
+            z_start = z_acc
+            z_end   = z_acc + th
+            break
+        z_acc += th
+    else:
+        raise ValueError(f"Layer '{layer_name}' not found in layer stack.")
+
+    code = CODES[code_key]
+    by, bx = block_size
+    ys, xs = np.ogrid[:ny, :nx]
+
+    if positions is None:
+        # Default: one macro per quadrant
+        positions = [
+            (ny//4,   nx//4),
+            (ny//4,   3*nx//4),
+            (3*ny//4, nx//4),
+            (3*ny//4, 3*nx//4),
+        ]
+
+    for cy, cx in positions:
+        y0 = max(0, cy - by//2)
+        y1 = min(ny, cy + by//2)
+        x0 = max(0, cx - bx//2)
+        x1 = min(nx, cx + bx//2)
+
+        # Define pattern inside block
+        region_ys, region_xs = np.ogrid[y0:y1, x0:x1]
+        if pattern_type == 'checker':
+            pattern = ((region_ys // pattern_pitch) + (region_xs // pattern_pitch)) % 2 == 0
+        elif pattern_type == 'lines':
+            pattern = (region_ys // pattern_pitch) % 2 == 0
+        else:
+            pattern = np.ones((y1 - y0, x1 - x0), dtype=bool)
+
+        # Paint pattern across all z-slices
+        for z in range(z_start, z_end):
+            out[z, y0:y1, x0:x1][pattern] = code
+
+    return out
+
+
+def route_local_interconnects(
+    vol: np.ndarray,
+    layers: list[tuple[str, int]],
+    gate_layer: str = 'Cu1',
+    via_code: str = 'Cu1',
+    wire_pitch: int = 20,
+    wire_width: int = 4,
+    n_wires: int = 8,
+    z_offset: int = 1
+) -> np.ndarray:
+    """
+    Draw horizontal Cu1 wires across rows and connect to vertical Cu2 vias.
+
+    Parameters
+    ----------
+    vol : ndarray
+        Volume to modify.
+    layers : list of (name, thickness)
+    gate_layer : str
+        Which layer to draw wires on.
+    via_code : str
+        Label for vias (usually same metal as lower layer).
+    wire_pitch : int
+        Spacing between wires.
+    wire_width : int
+        Width of wire stripes.
+    n_wires : int
+        Number of horizontal Cu1 wires.
+    z_offset : int
+        How deep into gate_layer to draw.
+    """
+    nz, ny, nx = vol.shape
+    out = vol.copy()
+
+    # Find Cu1 z index
+    z_acc = 0
+    for name, th in layers:
+        if name == gate_layer:
+            z_cu1 = z_acc + z_offset
+            break
+        z_acc += th
+
+    y0 = ny // 2 - (n_wires // 2) * wire_pitch
+    for i in range(n_wires):
+        y = y0 + i * wire_pitch
+        rows = slice(max(0, y - wire_width // 2), min(ny, y + wire_width // 2))
+        out[z_cu1, rows, :] = CODES[gate_layer]
+
+    # Add vias to Cu2
+    for name, th in layers:
+        if name == 'Cu2':
+            z_cu2 = z_acc
+            break
+        z_acc += th
+
+    ys, xs = np.ogrid[:ny, :nx]
+    r = wire_width // 2
+    for i in range(n_wires):
+        y = y0 + i * wire_pitch
+        for x in range(r, nx, 3 * wire_pitch):
+            mask = (ys - y) ** 2 + (xs - x) ** 2 <= r * r
+            for z in range(z_cu1 + 1, z_cu2):
+                out[z][mask] = CODES[via_code]
+
+    return out
+
+
+def add_power_grid(
+    vol: np.ndarray,
+    layers: list[tuple[str, int]],
+    layer_name: str = 'Cu5',
+    stripe_width: int = 8,
+    spacing: int = 64,
+    code_key: str = 'Cu5'
+) -> np.ndarray:
+    """
+    Add a horizontal + vertical power stripe grid in a top metal layer.
+    
+    Parameters
+    ----------
+    layer_name : str
+        Top metal layer to apply grid (e.g. 'Cu5')
+    stripe_width : int
+        Width of each power stripe
+    spacing : int
+        Distance between adjacent stripes
+    code_key : str
+        Label code from CODES (typically same as metal)
+    """
+    nz, ny, nx = vol.shape
+    out = vol.copy()
+
+    # Locate layer z-range
+    z_acc = 0
+    for name, th in layers:
+        if name == layer_name:
+            z_start = z_acc
+            z_end   = z_acc + th
+            break
+        z_acc += th
+    else:
+        raise ValueError(f"Layer '{layer_name}' not found.")
+
+    fill_val = CODES[code_key]
+
+    # Stripe grid mask
+    mask = np.zeros((ny, nx), dtype=bool)
+    for y in range(0, ny, spacing):
+        y0 = max(0, y - stripe_width//2)
+        y1 = min(ny, y + stripe_width//2)
+        mask[y0:y1, :] = True
+    for x in range(0, nx, spacing):
+        x0 = max(0, x - stripe_width//2)
+        x1 = min(nx, x + stripe_width//2)
+        mask[:, x0:x1] = True
+
+    # Apply to z-slices
+    for z in range(z_start, z_end):
+        out[z][mask] = fill_val
+
+    return out
+
+
+
+
+def add_metal_metal_decaps(
+    vol: np.ndarray,
+    layers: list[tuple[str, int]],
+    top: str = 'Cu4',
+    bottom: str = 'Cu3',
+    coverage: float = 0.1,
+    patch_size: int = 8,
+    pitch: int = 32
+) -> np.ndarray:
+    """
+    Add periodic parallel-plate decoupling capacitors between two metal layers.
+
+    Parameters
+    ----------
+    top : str
+        Top metal layer name (e.g., 'Cu4')
+    bottom : str
+        Bottom metal layer name (e.g., 'Cu3')
+    coverage : float
+        Approximate percentage of area covered with decaps
+    patch_size : int
+        Size of square metal plates
+    pitch : int
+        Distance between decaps
+    """
+    nz, ny, nx = vol.shape
+    out = vol.copy()
+
+    # Find z indices for bottom and top metal layers
+    z_acc = 0
+    z_bot, z_top = None, None
+    for name, th in layers:
+        if name == bottom:
+            z_bot = z_acc
+        if name == top:
+            z_top = z_acc
+        z_acc += th
+    if z_bot is None or z_top is None:
+        raise ValueError(f"Could not locate metal layers '{bottom}' or '{top}'")
+
+    y_centers = np.arange(patch_size//2, ny, pitch)
+    x_centers = np.arange(patch_size//2, nx, pitch)
+
+    for y in y_centers:
+        for x in x_centers:
+            if np.random.rand() > coverage:
+                continue
+            y0 = max(0, y - patch_size//2)
+            y1 = min(ny, y + patch_size//2)
+            x0 = max(0, x - patch_size//2)
+            x1 = min(nx, x + patch_size//2)
+            out[z_bot, y0:y1, x0:x1] = CODES[bottom]
+            out[z_top, y0:y1, x0:x1] = CODES[top]
+
+    return out
+
+
+
+def generate_transistor_array(
+    vol: np.ndarray,
+    layers: list[tuple[str,int]],
+    n_rows: int = 8,
+    n_cols: int = 16,
+    pitch_y: int = 24,
+    pitch_x: int = 20,
+    gate_w: int = 8,
+    gate_l: int = 4,
+    gate_th: int = 4,
+    oxide_th: int = 2,
+    diff_th: int = 3,
+    silicide_th: int = 1,
+    well_margin: int = 10
+) -> np.ndarray:
+    """
+    Generate a grid of MOSFETs (NMOS/PMOS alternating in Y) with:
+    - shared diffusion
+    - alternating n-well and p-well
+    - gate, oxide, silicide
+    - STI isolation between rows
+    """
+    out = vol.copy()
+    nz, ny, nx = vol.shape
+    cy = ny // 2
+    cx = nx // 2
+
+    ys, xs = np.ogrid[:ny, :nx]
+
+    # Find top of substrate
+    z_acc = 0
+    for name, th in layers:
+        if name == 'Si_substrate':
+            z_sub = z_acc
+            break
+        z_acc += th
+
+    for i in range(n_rows):
+        for j in range(n_cols):
+            y0 = cy - (n_rows//2)*pitch_y + i*pitch_y
+            x0 = cx - (n_cols//2)*pitch_x + j*pitch_x
+
+            is_nmos = (i % 2 == 0)
+
+            half_w = gate_w // 2
+            gate_mask = (ys >= y0 - half_w) & (ys <= y0 + half_w) & \
+                        (xs >= x0 - half_w) & (xs <= x0 + half_w)
+
+            # Gate oxide
+            for z in range(z_sub, min(z_sub + oxide_th, nz)):
+                out[z][gate_mask] = CODES['Buried_SiO2']
+
+            # Poly gate
+            for z in range(z_sub + oxide_th, min(z_sub + oxide_th + gate_th, nz)):
+                out[z][gate_mask] = CODES.get('Cu1', CODES['pad_contact'])
+
+            # Diffusion left/right
+            diff_mask_L = (ys >= y0 - half_w) & (ys <= y0 + half_w) & (xs < x0 - half_w)
+            diff_mask_R = (ys >= y0 - half_w) & (ys <= y0 + half_w) & (xs > x0 + half_w)
+            for z in range(z_sub + oxide_th + gate_th,
+                           min(z_sub + oxide_th + gate_th + diff_th, nz)):
+                out[z][diff_mask_L] = CODES['SOD']
+                out[z][diff_mask_R] = CODES['SOD']
+
+            # Silicide
+            for z in range(z_sub + oxide_th + gate_th + diff_th,
+                           min(z_sub + oxide_th + gate_th + diff_th + silicide_th, nz)):
+                out[z][diff_mask_L] = CODES['Barrier']
+                out[z][diff_mask_R] = CODES['Barrier']
+
+            # Well region (entire row stripe)
+            well_y0 = max(0, y0 - pitch_y//2 + well_margin)
+            well_y1 = min(ny, y0 + pitch_y//2 - well_margin)
+            well_mask = np.zeros((ny, nx), dtype=bool)
+            well_mask[well_y0:well_y1, :] = True
+
+            well_code = CODES['nwell'] if is_nmos else CODES['pwell']
+            for z in range(z_sub, min(z_sub + 20, nz)):
+                out[z][well_mask] = well_code
+
+    # Add STI trenches between rows
+    y_gaps = [cy - (n_rows // 2) * pitch_y + i * pitch_y for i in range(1, n_rows)]
+    out = add_active_region_isolation(out, layers, y_positions=y_gaps, width=4)
+
+    return out
+
 
 #--------------------------------------------------
 # 2) Planar layer generator
@@ -236,7 +766,7 @@ def add_metal_layer(
     metal_code = CODES[code_key]
 
     # 2) Build 2D mask
-    ys, xs = np.ogrid[:ny, :nx]
+    ys, xs = np.mgrid[:ny, :nx]
     if pattern is None:
         mask2d = np.ones((ny, nx), dtype=bool)
     else:
@@ -340,93 +870,103 @@ def add_passivation_layer(
     vol[z_start:z_end, :, :] = CODES[code_key]
     return vol
 
-def add_pad_and_plug(
+def add_solder_pad_array(
     vol: np.ndarray,
-    layers: list[tuple[str,int]],
-    pad_diameter: int,
-    center: tuple[int,int] | None = None,
+    layers: list[tuple[str, int]],
+    pad_diameter: int = 30,
+    array_shape: tuple[int, int] = (4, 4),
+    spacing: int = 64,
     pad_code: str = 'pad_contact',
-    plug_code: str = 'W_plug'
+    plug_code: str = 'W_plug',
+    bump_code: str = 'solder_bump'
 ) -> np.ndarray:
     """
-    Create a circular contact pad & tungsten plug.
-
-    - Carve through the passivation slab (SiN_passivation) and fill with pad metal.
-    - In the pad_contact slab below, fill the same footprint with tungsten plug.
-
-    Parameters
-    ----------
-    vol : ndarray (nz, ny, nx)
-    layers : list of (name, thickness)
-        Must include 'SiN_passivation' and 'pad_contact'.
-    pad_diameter : int
-        Diameter of the pad/plug in voxels.
-    center : (y,x) or None
-        Center position. Defaults to image center.
-    pad_code : str
-        Key in CODES for pad metal (e.g. 'pad_contact').
-    plug_code : str
-        Key in CODES for plug metal (e.g. 'W_plug').
+    Add a grid of soldering pads and bumps with plug vias beneath.
     """
     nz, ny, nx = vol.shape
-    cy, cx = (ny//2, nx//2) if center is None else center
-
-    # build 2D mask
-    ys, xs = np.ogrid[:ny, :nx]
-    r = pad_diameter // 2
-    mask = (ys - cy)**2 + (xs - cx)**2 <= r*r
-
+    cy, cx = ny // 2, nx // 2
     out = vol.copy()
 
-    # 1) Find passivation z-range
-    z0 = 0
+    # locate z-ranges
+    z_pass, z_pad = 0, 0
     for name, th in layers:
         if name == 'SiN_passivation':
-            z_pass_s = z0
-            z_pass_e = z0 + th
+            z_pass = z_pad
+        elif name == 'pad_contact':
+            z_pad = z_pass + th
             break
-        z0 += th
+        z_pass += th
 
-    # carve pad through passivation
-    pad_val = CODES[pad_code]
-    out[z_pass_s:z_pass_e, :, :][ :, mask ] = pad_val
+    # bump height
+    R = pad_diameter // 2
+    bump_h = R
 
-    # 2) Find pad_contact z-range
-    z0 = 0
-    for name, th in layers:
-        if name == 'pad_contact':
-            z_pad_s = z0
-            z_pad_e = z0 + th
-            break
-        z0 += th
+    # Extend volume for solder bumps
+    extended = np.zeros((nz + bump_h, ny, nx), dtype=vol.dtype)
+    extended[bump_h:] = out
 
-    # fill tungsten plug in pad_contact slab
-    plug_val = CODES[plug_code]
-    out[z_pad_s:z_pad_e, :, :][:, mask] = plug_val
+    # Grid placement
+    ys, xs = np.ogrid[:ny, :nx]
+    offset_y = cy - (array_shape[0] // 2) * spacing + spacing // 2
+    offset_x = cx - (array_shape[1] // 2) * spacing + spacing // 2
+
+    for i in range(array_shape[0]):
+        for j in range(array_shape[1]):
+            py = offset_y + i * spacing
+            px = offset_x + j * spacing
+
+            mask = (ys - py)**2 + (xs - px)**2 <= R**2
+
+            # Passivation cut + pad metal
+            for z in range(z_pass, z_pass + 5):
+                extended[bump_h + z][mask] = CODES[pad_code]
+            # Tungsten plug
+            for z in range(z_pad, z_pad + 4):
+                extended[bump_h + z][mask] = CODES[plug_code]
+
+            # Bump (hemisphere)
+            for dz in range(bump_h):
+                r = int(np.sqrt(R * R - dz * dz))
+                if r <= 0: continue
+                bump_mask = (ys - py)**2 + (xs - px)**2 <= r**2
+                extended[bump_h - dz - 1][bump_mask] = CODES[bump_code]
+
+    return extended
+
+def add_underfill_and_rdl(
+    vol: np.ndarray,
+    layers: list[tuple[str, int]],
+    underfill_th: int = 3,
+    rdl_th: int = 2,
+    underfill_code: str = 'underfill',
+    rdl_code: str = 'Cu5'
+) -> np.ndarray:
+    """
+    Adds a polymer underfill layer and an RDL metal layer just above solder bumps.
+    - underfill fills the space between bumps
+    - RDL is a thin metal routing layer over underfill
+    """
+    nz, ny, nx = vol.shape
+    out = np.zeros((nz + underfill_th + rdl_th, ny, nx), dtype=vol.dtype)
+    out[underfill_th + rdl_th:] = vol
+
+    ys, xs = np.ogrid[:ny, :nx]
+
+    # Identify bump positions
+    bump_code = CODES['solder_bump']
+    bump_mask = np.any(vol == bump_code, axis=0)
+
+    # Fill underfill: all space not occupied by bumps
+    for z in range(underfill_th, underfill_th + rdl_th):
+        mask = ~bump_mask
+        out[z][mask] = CODES[underfill_code]
+
+    # RDL layer: fill everything (or add pattern later)
+    out[:rdl_th] = CODES[rdl_code]
 
     return out
 
-def add_solder_bump(vol, base_diameter, code='solder_bump'):
-    """
-    Append a hemispherical solder bump on top of passivation.
-    """
-    # existing bump logic
-    nz, ny, nx = vol.shape
-    R = base_diameter//2
-    H = R
-    new_vol = np.zeros((nz+H, ny, nx), dtype=vol.dtype)
-    new_vol[H:] = vol
-    cy, cx = ny//2, nx//2
-    ys, xs = np.ogrid[:ny, :nx]
-    for dz in range(H):
-        r = int(np.sqrt(R*R - dz*dz))
-        z0 = H - dz - 1
-        if r>0:
-            mask = (ys-cy)**2 + (xs-cx)**2 <= r*r
-            new_vol[z0][mask] = CODES[code]
-        else:
-            new_vol[z0, cy, cx] = CODES[code]
-    return new_vol
+
 
 def add_via(
     vol: np.ndarray,
@@ -955,8 +1495,8 @@ def add_FEOL_contact_cut_and_plug(
 ) -> np.ndarray:
     """
     Carve contact holes through the SiN passivation and fill:
-      – the passivation slab with pad metal (pad_code)
-      – the pad_contact slab with tungsten (plug_code)
+      - the passivation slab with pad metal (pad_code)
+      - the pad_contact slab with tungsten (plug_code)
 
     centers: list of (y,x) positions for each contact.
     """
@@ -1073,46 +1613,160 @@ def add_FEOL_thermal_vias_and_spreader(
     return out
 
 
-#--------------------------------------------------
-# # Defects and other features
-#--------------------------------------------------
-
-def add_random_defects(
+def apply_floorplan_regions(
     vol: np.ndarray,
-    defect_rate: float = 1e-4,
-    defect_code: int | None = 0,
-    seed: int = 42
+    floorplan: dict[str, tuple[tuple[int,int], tuple[int,int], tuple[int,int]]],
+    label_map: dict[str, str]
 ) -> np.ndarray:
     """
-    Randomly introduce defects into the volume.
+    Apply unique material codes to different chip regions based on floorplan.
 
     Parameters
     ----------
     vol : ndarray (nz, ny, nx)
-    defect_rate : float
-        Fraction of voxels to corrupt (e.g. 1e-4 = 0.01%).
-    defect_code : int or None
-        Value to write into defected voxels (0 = void, or any CODES value).
-    seed : int
-        RNG seed for reproducibility.
+    floorplan : dict of region -> ((z0,z1), (y0,y1), (x0,x1))
+    label_map : dict of region -> material name (must exist in CODES)
 
     Returns
     -------
-    new_vol : ndarray
-        Volume with random defects applied.
+    Modified volume with regions filled with corresponding material.
     """
-    nz, ny, nx = vol.shape
-    total = nz * ny * nx
-    n_defects = int(total * defect_rate)
+    out = vol.copy()
+    for region, bounds in floorplan.items():
+        if region not in label_map:
+            continue
+        z_rng, y_rng, x_rng = bounds
+        code = CODES[label_map[region]]
+        out[z_rng[0]:z_rng[1], y_rng[0]:y_rng[1], x_rng[0]:x_rng[1]] = code
+    return out
+
+
+def populate_region_features(vol, layers, floorplan):
+    """
+    Apply region-specific micro-features to chip floorplan areas.
+    
+    Parameters:
+    -----------
+    vol : np.ndarray
+        The full chip volume (z, y, x).
+    layers : list of (name, thickness)
+        Layer stack.
+    floorplan : dict
+        Dictionary of region name -> ((z0,z1),(y0,y1),(x0,x1)) bounds.
+
+    Returns:
+    --------
+    Modified volume with regional features applied.
+    """
+    for name, bounds in floorplan.items():
+        zrange, yrange, xrange = bounds
+        region = vol[zrange[0]:zrange[1], yrange[0]:yrange[1], xrange[0]:xrange[1]]
+
+        if name == 'core':
+            region = generate_transistor_array(
+                region, layers,
+                n_rows=8, n_cols=16,
+                pitch_y=24, pitch_x=20,
+                gate_w=8, gate_l=4,
+                gate_th=4, oxide_th=2,
+                diff_th=3, silicide_th=1
+            )
+
+        elif name == 'sram':
+            region = add_sram_macro_blocks(
+                region, layers,
+                layer_name='Cu3',
+                block_size=(64, 64),
+                pattern_pitch=4,
+                pattern_type='checker',
+                positions=None,
+                code_key='Cu3'
+            )
+
+        elif name == 'periphery':
+            region = add_io_periphery_routing(region, layers)
+
+        elif name == 'analog':
+            region = add_analog_block(
+                region, layers,
+                region=((0, region.shape[0]), (0, region.shape[1]), (0, region.shape[2]))
+            )
+        vol[zrange[0]:zrange[1], yrange[0]:yrange[1], xrange[0]:xrange[1]] = region
+
+    return vol
+
+
+#--------------------------------------------------
+# # Defects and other features
+#--------------------------------------------------
+
+
+def add_structural_defects(
+    vol: np.ndarray,
+    layers: list[tuple[str, int]],
+    codes: dict,
+    defect_types=('void', 'open', 'short', 'particle'),
+    rate=1e-5,
+    affected_labels: list[int] = None,
+    seed: int = 42
+) -> np.ndarray:
+    """
+    Realistic chip defects into specific material layers.
+
+    Parameters
+    ----------
+    vol : ndarray
+        The 3D volume of the chip.
+    layers : list of (name, thickness)
+        Layer definitions to identify z-ranges.
+    codes : dict
+        Material name to label code mapping.
+    defect_types : tuple of str
+        Types of defects: 'void', 'open', 'short', 'particle'.
+    rate : float
+        Fraction of voxels to be affected.
+    affected_labels : list[int], optional
+        Only apply defects to these material labels (e.g., [Cu1, Cu2, ...]).
+        If None, affects all non-zero voxels.
+    seed : int
+        RNG seed.
+    """
     rng = np.random.default_rng(seed)
+    nz, ny, nx = vol.shape
+    total_voxels = nz * ny * nx
 
-    # randomly choose linear indices to defect
-    inds = rng.choice(total, size=n_defects, replace=False)
-    new_vol = vol.copy().ravel()
-    fill_val = defect_code if defect_code is not None else 0
-    new_vol[inds] = fill_val
+    vol_out = vol.copy()
 
-    return new_vol.reshape((nz, ny, nx))
+    # Mask where defects can be applied
+    if affected_labels:
+        mask = np.isin(vol, affected_labels)
+    else:
+        mask = vol > 0  # apply to any non-zero material
+
+    indices = np.argwhere(mask)
+    n_defects = int(len(indices) * rate)
+
+    if n_defects == 0:
+        return vol_out
+
+    defect_inds = indices[rng.choice(len(indices), n_defects, replace=False)]
+
+    for z, y, x in defect_inds:
+        typ = rng.choice(defect_types)
+        if typ == 'void':
+            vol_out[z, y, x] = 0
+        elif typ == 'open':
+            # Remove local wire patch
+            vol_out[z, max(0,y-1):y+2, max(0,x-1):x+2] = 0
+        elif typ == 'short':
+            # Bridge to a neighboring layer
+            if z < nz - 1:
+                vol_out[z+1, y, x] = vol[z, y, x]
+        elif typ == 'particle':
+            # Add random speckle (foreign contaminant)
+            vol_out[z, y, x] = rng.integers(1, 255)
+
+    return vol_out
 
 
 #--------------------------------------------------
@@ -1148,16 +1802,15 @@ def generate_chip(
         ('SiN_passivation',  5),
         ('pad_contact',      4)
     ]
-
-    nz, ny, nx = shape               # ← unpack here
-    channel_width = 20
-
-
-
     layers = add_substrate(shape, layers)
     # planar stack
     vol = generate_planar_stack(shape, layers)
 
+
+    # 1. Unpack shape first
+    nz, ny, nx = shape
+
+    channel_width = 20
 
     rng_vars = sample_FEOL_variations(seed=42)
 
@@ -1182,17 +1835,33 @@ def generate_chip(
         code_key='STI'
     )
 
-    vol = add_FEOL_transistor_pair(
+    vol = generate_transistor_array(
         vol, layers,
-        channel_width=20,
-        channel_length=4,
-        gate_oxide_th=2,
-        poly_th=4,
-        spacing=40
+        n_rows=8,
+        n_cols=16,
+        pitch_y=24,
+        pitch_x=20,
+        gate_w=8,
+        gate_l=4,
+        gate_th=4,
+        oxide_th=2,
+        diff_th=3,
+        silicide_th=1
     )
 
 
+    vol = add_well_taps(vol, layers, well_type='nwell', pitch=64)
+    vol = add_well_taps(vol, layers, well_type='pwell', pitch=64)
 
+    vol = route_local_interconnects(
+        vol, layers,
+        gate_layer='Cu1',
+        via_code='Cu1',
+        wire_pitch=20,
+        wire_width=4,
+        n_wires=8
+    )
+   
     # 3. Gate stack (oxide + polysilicon)
     # FEOL: gate stack
     vol = add_FEOL_gate_stack(
@@ -1293,6 +1962,18 @@ def generate_chip(
     vol = add_metal_layer(vol, layers, layer_name='Cu5', code_key='Cu5')
 
 
+    vol = add_io_periphery_routing(vol, layers)
+
+    vol = add_sram_macro_blocks(
+        vol, layers,
+        layer_name='Cu3',
+        block_size=(64, 64),
+        pattern_pitch=4,
+        pattern_type='checker',  # or 'lines' / 'solid'
+        positions=None,          # or manually set [(cy, cx), ...]
+        code_key='Cu3'
+    )
+
     vol = add_barrier_layer(vol, layers, metal_layer='Cu3', barrier_thickness=2)
     vol = add_barrier_layer(vol, layers, metal_layer='Cu4', barrier_thickness=2)
     vol = add_barrier_layer(vol, layers, metal_layer='Cu5', barrier_thickness=2)
@@ -1337,22 +2018,50 @@ def generate_chip(
         via_code='Cu4'
     )
 
+    # Add power grid to Cu5
+    vol = add_power_grid(
+        vol, layers,
+        layer_name='Cu5',
+        stripe_width=8,
+        spacing=64,
+        code_key='Cu5'
+    )
+
+    vol = add_dummy_fills(vol, layers, layer_name='Cu2', code_key='Cu2')
+    vol = add_dummy_fills(vol, layers, layer_name='Cu3', code_key='Cu3')
+    vol = add_dummy_fills(vol, layers, layer_name='Cu4', code_key='Cu4')
+
+
+    # Decoupling capacitors between Cu3 and Cu4
+    vol = add_metal_metal_decaps(vol, layers,
+        top='Cu4', bottom='Cu3',
+        coverage=0.2, patch_size=6, pitch=32
+    )
+
+
     vol = add_passivation_layer(vol, layers,
                                 layer_name='SiN_passivation',
                                 code_key='SiN_passivation')
 
 
-    # now add contact pad & plug:
-    vol = add_pad_and_plug(
+    vol = add_solder_pad_array(
         vol, layers,
-        pad_diameter=50,
-        center=(ny//2, nx//2),
+        pad_diameter=30,
+        array_shape=(4, 4),
+        spacing=64,
         pad_code='pad_contact',
-        plug_code='W_plug'
+        plug_code='W_plug',
+        bump_code='solder_bump'
     )
 
+    vol = add_underfill_and_rdl(
+        vol, layers,
+        underfill_th=3,
+        rdl_th=2,
+        underfill_code='underfill',
+        rdl_code='Cu5'  # or custom 'RDL' label
+    )
 
-    vol = add_solder_bump(vol, base_diameter)
 
     if via_specs:
         for spec in via_specs:
@@ -1377,15 +2086,6 @@ def generate_chip(
         plate_code='Cu5',
         end_layer='Cu1'
     )
-    seed_defects = 44
-    vol = add_random_defects(
-        vol,
-        defect_rate=5e-5,    # ~0.005% of voxels
-        defect_code=0,        # carve voids
-        seed=seed_defects             # use same seed for reproducibility
-    )
-
-
     return vol, layers
 
 if __name__ == '__main__':
@@ -1407,16 +2107,38 @@ if __name__ == '__main__':
     # tile it 2×2 in‐plane
     tiled = tile_unit_cell(model, grid=(8,8))
 
-    # update shape and (if needed) layers metadata
-    # shape_z unchanged, but y,x doubled
     nz, ny, nx = tiled.shape
+
+    floorplan = {
+        'core':     ((0, nz),   (0, 1024),   (0, 1024)),
+        'sram':     ((0, nz),   (0, 1024),   (1024, 2048)),
+        'periphery':((0, nz),   (1024, 2048), (0, 1024)),
+        'analog':   ((0, nz),   (1024, 2048), (1024, 2048)),
+    }
+
+    region_labels = {
+        'core':     'Cu3',
+        'sram':     'Cu2',
+        'periphery':'Cu1',
+        'analog':   'Barrier'
+    }
+    tiled = populate_region_features(tiled, layers, floorplan)
+
+    tiled = add_structural_defects(
+        tiled, layers, codes=CODES,
+        defect_types=('void', 'short', 'particle'),
+        rate=2e-5,
+        affected_labels=[CODES['Cu1'], CODES['Cu2'], CODES['Cu3']],
+        seed=123
+    )
+
     logger.info(f"Tiled model shape={tiled.shape}")
 
     #SAVE DATA
     save_mzarr(
         data=tiled,
         codes=CODES,
-        out_dir="chip_model.zarr",
+        out_dir="data/chip_model.zarr",
         voxel_size=(0.25, 0.25, 0.1),
         n_scales=3,
         base_chunk=(64, 64, 64),
