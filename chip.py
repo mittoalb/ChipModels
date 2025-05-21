@@ -556,7 +556,6 @@ def generate_transistor_array(
     - shared diffusion
     - alternating n-well and p-well
     - gate, oxide, silicide
-    - STI isolation between rows
     """
     out = vol.copy()
     nz, ny, nx = vol.shape
@@ -567,6 +566,7 @@ def generate_transistor_array(
 
     # Find top of substrate
     z_acc = 0
+    z_sub = 0
     for name, th in layers:
         if name == 'Si_substrate':
             z_sub = z_acc
@@ -575,11 +575,13 @@ def generate_transistor_array(
 
     for i in range(n_rows):
         for j in range(n_cols):
-            y0 = cy - (n_rows//2)*pitch_y + i*pitch_y
-            x0 = cx - (n_cols//2)*pitch_x + j*pitch_x
+            y0 = cy - (n_rows // 2) * pitch_y + i * pitch_y
+            x0 = cx - (n_cols // 2) * pitch_x + j * pitch_x
 
+            # Determine NMOS or PMOS
             is_nmos = (i % 2 == 0)
 
+            # Gate stripe
             half_w = gate_w // 2
             gate_mask = (ys >= y0 - half_w) & (ys <= y0 + half_w) & \
                         (xs >= x0 - half_w) & (xs <= x0 + half_w)
@@ -592,35 +594,36 @@ def generate_transistor_array(
             for z in range(z_sub + oxide_th, min(z_sub + oxide_th + gate_th, nz)):
                 out[z][gate_mask] = CODES.get('Cu1', CODES['pad_contact'])
 
-            # Diffusion left/right
+            # Diffusion
             diff_mask_L = (ys >= y0 - half_w) & (ys <= y0 + half_w) & (xs < x0 - half_w)
             diff_mask_R = (ys >= y0 - half_w) & (ys <= y0 + half_w) & (xs > x0 + half_w)
-            for z in range(z_sub + oxide_th + gate_th,
-                           min(z_sub + oxide_th + gate_th + diff_th, nz)):
-                out[z][diff_mask_L] = CODES['SOD']
-                out[z][diff_mask_R] = CODES['SOD']
+            code_diff = CODES['SOD']
+            for z in range(z_sub + gate_th + oxide_th, min(z_sub + gate_th + oxide_th + diff_th, nz)):
+                out[z][diff_mask_L] = code_diff
+                out[z][diff_mask_R] = code_diff
 
             # Silicide
-            for z in range(z_sub + oxide_th + gate_th + diff_th,
-                           min(z_sub + oxide_th + gate_th + diff_th + silicide_th, nz)):
+            for z in range(z_sub + gate_th + oxide_th + diff_th,
+                           min(z_sub + gate_th + oxide_th + diff_th + silicide_th, nz)):
                 out[z][diff_mask_L] = CODES['Barrier']
                 out[z][diff_mask_R] = CODES['Barrier']
 
-            # Well region (entire row stripe)
-            well_y0 = max(0, y0 - pitch_y//2 + well_margin)
-            well_y1 = min(ny, y0 + pitch_y//2 - well_margin)
-            well_mask = np.zeros((ny, nx), dtype=bool)
-            well_mask[well_y0:well_y1, :] = True
+            # Wells (use wider stripe per row)
+            ys, xs = np.ogrid[:ny, :nx]
+            row_mask = (ys >= y0 - pitch_y // 2 + well_margin) & \
+                    (ys <= y0 + pitch_y // 2 - well_margin)
+            mask2d = np.broadcast_to(row_mask, (ny, nx))  # ensure shape matches
 
             well_code = CODES['nwell'] if is_nmos else CODES['pwell']
             for z in range(z_sub, min(z_sub + 20, nz)):
-                out[z][well_mask] = well_code
+                out[z][mask2d] = well_code
 
-    # Add STI trenches between rows
+    # Add isolation regions between rows
     y_gaps = [cy - (n_rows // 2) * pitch_y + i * pitch_y for i in range(1, n_rows)]
     out = add_active_region_isolation(out, layers, y_positions=y_gaps, width=4)
 
     return out
+
 
 
 #--------------------------------------------------
