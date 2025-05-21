@@ -1,0 +1,87 @@
+{
+  "Si_substrate": {
+    "label": 1,
+    "composition": { "Si": 1 },
+    "density": 2.33
+  },
+  "Buried_SiO2": {
+    "label": 2,
+    "composition": { "Si": 1, "O": 2 },
+    "density": 2.2
+  },
+  "STI": {
+    "label": 3,
+    "composition": { "Si": 1, "O": 2 },
+    "density": 2.2
+  },
+  "PSG": {
+    "label": 4,
+    "composition": { "Si": 1, "O": 2, "P": 0.05 },
+    "density": 2.3
+  },
+  "SOD": {
+    "label": 5,
+    "composition": { "Si": 1, "O": 2 },
+    "density": 1.8
+  },
+  "Barrier": {
+    "label": 6,
+    "composition": { "Ta": 1, "N": 1 },
+    "density": 14.0
+  },
+  "Cu1": {
+    "label": 7,
+    "composition": { "Cu": 1 },
+    "density": 8.96
+  },
+  "Cu2": {
+    "label": 8,
+    "composition": { "Cu": 1 },
+    "density": 8.96
+  },
+  "Cu3": {
+    "label": 9,
+    "composition": { "Cu": 1 },
+    "density": 8.96
+  },
+  "Cu4": {
+    "label": 10,
+    "composition": { "Cu": 1 },
+    "density": 8.96
+  },
+  "Cu5": {
+    "label": 11,
+    "composition": { "Cu": 1 },
+    "density": 8.96
+  },
+  "SiN_passivation": {
+    "label": 12,
+    "composition": { "Si": 3, "N": 4 },
+    "density": 3.1
+  },
+  "pad_contact": {
+    "label": 13,
+    "composition": { "Al": 1 },
+    "density": 2.7
+  },
+  "W_plug": {
+    "label": 14,
+    "composition": { "W": 1 },
+    "density": 19.3
+  },
+  "solder_bump": {
+    "label": 15,
+    "composition": { "Sn": 0.96, "Ag": 0.03, "Cu": 0.01 },
+    "density": 7.4
+  },
+  "pwell": {
+    "label": 16,
+    "composition": { "Si": 1 },
+    "density": 2.33
+  },
+  "nwell": {
+    "label": 17,
+    "composition": { "Si": 1 },
+    "density": 2.33
+  }
+}
