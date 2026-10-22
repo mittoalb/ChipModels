@@ -2108,7 +2108,7 @@ if __name__ == '__main__':
 
 
     # tile it 2×2 in‐plane
-    tiled = tile_unit_cell(model, grid=(8,8))
+    tiled = tile_unit_cell(model, grid=(2,2))
 
     nz, ny, nx = tiled.shape
 
