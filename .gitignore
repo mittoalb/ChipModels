@@ -1,0 +1,23 @@
+# Generator outputs
+*.zarr
+*.n5
+*.h5
+data/
+
+# Logs
+*.log
+chipgen.log
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.ipynb_checkpoints/
+
+# Build
+build/
+dist/
+
+# Env
+.venv/
+env/

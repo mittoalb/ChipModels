@@ -1,0 +1,19 @@
+[project]
+name = "ChipModels"
+version = "0.1.0"
+description = "Synthetic 3-D phantoms of silicon microchip packages for tomography"
+authors = [{ name = "Alberto Mittone", email = "amittone@anl.gov" }]
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = [
+    "numpy",
+    "scipy",
+    "z5py",
+]
+
+[build-system]
+requires = ["setuptools", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+py-modules = ["chip"]
