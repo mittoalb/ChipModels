@@ -42,7 +42,6 @@ Research code — API is in flux. Pull requests welcome.
 
 ## License
 
-Same as the parent TomoModels project. See `LICENSE` once added.
 
 ## Attribution
 
