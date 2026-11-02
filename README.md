@@ -45,5 +45,4 @@ Research code — API is in flux. Pull requests welcome.
 
 ## Attribution
 
-Original author: Alberto Mittone (@mittoalb). History preserved via
-`git-filter-repo` from TomoModels' `Semiconductors/` subtree.
+Original author: Alberto Mittone (@mittoalb). 
