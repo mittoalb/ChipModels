@@ -4,13 +4,6 @@ Synthetic 3-D phantoms of silicon microchip packages for tomographic
 reconstruction, image-segmentation benchmarks, and physics-based rendering
 experiments.
 
-This repository was **spun out of
-[TomoModels](https://github.com/mittoalb/TomoModels)** on 2026-10-22 when the
-brain-modelling and chip-modelling pipelines diverged in scope. The chip code
-only ever shared a thin IO layer with the brain simulator (OME-Zarr output,
-density / composition lookup tables), so splitting it keeps each repo focused
-on its domain.
-
 ## Scope
 
 * `chip.py` — single-script chip-package generator: layered FEOL / BEOL stack,
